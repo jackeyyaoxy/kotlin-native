@@ -963,21 +963,20 @@ ALWAYS_INLINE void runDeallocationHooks(ContainerHeader* container) {
 #endif  // USE_CYCLIC_GC
     if (obj->has_meta_object()) {
       if (KonanNeedDebugInfo && (obj->type_info()->flags_ & TF_LEAK_DETECTOR_CANDIDATE) != 0 && Kotlin_memoryLeakCheckerEnabled()) {
-        // Remove the object from the double-linked list of potentially cyclic objects.
-        auto* meta = obj->meta_object();
         LockGuard<SimpleMutex> leakCheckerGuard(g_leakCheckerGlobalLock);
-        // Get previous.
-        auto* previous = meta->LeakDetector.previous_;
-        auto* previousMeta = (previous != nullptr) ? previous->meta_object() : nullptr;
-        auto* next = meta->LeakDetector.next_;
-        auto* nextMeta = (next != nullptr) ? next->meta_object() : nullptr;
-        // Remove current.
-        if (previousMeta != nullptr)
-          previousMeta->LeakDetector.next_ = next;
-        if (nextMeta != nullptr)
-          nextMeta->LeakDetector.previous_ = previous;
-        if (obj == g_leakCheckerGlobalList)
+
+        // Remove the object from the double-linked list of potentially cyclic objects.
+        auto* previous = obj->meta_object()->LeakDetector.previous_;
+        auto* next = obj->meta_object()->LeakDetector.next_;
+        if (previous) {
+          previous->meta_object()->LeakDetector.next_ = next;
+        }
+        if (next) {
+          next->meta_object()->LeakDetector.previous_ = previous;
+        }
+        if (obj == g_leakCheckerGlobalList) {
           g_leakCheckerGlobalList = next;
+        }
       }
       ObjHeader::destroyMetaObject(&obj->typeInfoOrMeta_);
     }
@@ -2028,14 +2027,15 @@ OBJ_GETTER(allocInstance, const TypeInfo* type_info) {
   auto container = ObjectContainer(state, type_info);
   ObjHeader* obj = container.GetPlace();
   if (KonanNeedDebugInfo && Kotlin_memoryLeakCheckerEnabled() && (type_info->flags_ & TF_LEAK_DETECTOR_CANDIDATE) != 0) {
-    // Add newly allocated object to the double-linked list of potentially cyclic objects.
-    MetaObjHeader* meta = obj->meta_object();
     LockGuard<SimpleMutex> leakCheckerGuard(g_leakCheckerGlobalLock);
+
+    // Add newly allocated object to the double-linked list of potentially cyclic objects.
     KRef old = g_leakCheckerGlobalList;
     g_leakCheckerGlobalList = obj;
-    meta->LeakDetector.next_ = old;
-    if (old != nullptr)
+    obj->meta_object()->LeakDetector.next_ = old;
+    if (old != nullptr) {
       old->meta_object()->LeakDetector.previous_ = obj;
+    }
   }
 #if USE_GC
   if (Strict) {
@@ -2730,15 +2730,15 @@ struct CycleDetectorRootset {
 CycleDetectorRootset collectCycleDetectorRootset() {
   CycleDetectorRootset rootset;
   LockGuard<SimpleMutex> leakCheckerGuard(g_leakCheckerGlobalLock);
-  auto* candidate = g_leakCheckerGlobalList;
-  while (candidate != nullptr) {
+  for (auto* candidate = g_leakCheckerGlobalList;
+      candidate != nullptr;
+      candidate = candidate->meta_object()->LeakDetector.next_) {
     rootset.roots.push_back(candidate);
     rootset.heldRefs.emplace_back(candidate);
     traverseReferredObjects(candidate, [&rootset, candidate](KRef field) {
       rootset.rootToFields[candidate].push_back(field);
       rootset.heldRefs.emplace_back(field);
     });
-    candidate = candidate->meta_object()->LeakDetector.next_;
   }
   return rootset;
 }
@@ -2746,6 +2746,7 @@ CycleDetectorRootset collectCycleDetectorRootset() {
 KStdVector<KRef> findCycleWithDFS(KRef root, const CycleDetectorRootset& rootset) {
   auto traverseFields = [&rootset](KRef obj, auto process) {
     auto it = rootset.rootToFields.find(obj);
+    // If obj is in the rootset, use it's pinned state.
     if (it != rootset.rootToFields.end()) {
       const auto& fields = it->second;
       for (KRef field: fields) {
@@ -2756,9 +2757,7 @@ KStdVector<KRef> findCycleWithDFS(KRef root, const CycleDetectorRootset& rootset
       return;
     }
 
-    traverseReferredObjects(obj, [process](KRef field) {
-      process(field);
-    });
+    traverseReferredObjects(obj, process);
   };
 
   KStdVector<KStdVector<KRef>> toVisit;
@@ -2796,8 +2795,7 @@ KStdVector<KRef> findCycleWithDFS(KRef root, const CycleDetectorRootset& rootset
 
 template <typename C>
 OBJ_GETTER(createAndFillArray, const C& container) {
-  int numElements = container.size();
-  ArrayHeader* result = AllocArrayInstance(theArrayTypeInfo, numElements, OBJ_RESULT)->array();
+  auto* result = AllocArrayInstance(theArrayTypeInfo, container.size(), OBJ_RESULT)->array();
   KRef* place = ArrayAddressOfElementAt(result, 0);
   for (KRef it: container) {
     UpdateHeapRef(place++, it);
