@@ -128,9 +128,102 @@ volatile int aliveMemoryStatesCount = 0;
 
 KBoolean g_hasCyclicCollector = true;
 
-// Only used by the leak detector.
-KRef g_leakCheckerGlobalList = nullptr;
-SimpleMutex g_leakCheckerGlobalLock;
+// TODO: Consider using ObjHolder.
+class ScopedRefHolder {
+ public:
+  ScopedRefHolder() = default;
+
+  explicit ScopedRefHolder(KRef obj);
+
+  ScopedRefHolder(const ScopedRefHolder&) = delete;
+
+  ScopedRefHolder(ScopedRefHolder&& other) noexcept: obj_(other.obj_) {
+    other.obj_ = nullptr;
+  }
+
+  ScopedRefHolder& operator=(const ScopedRefHolder&) = delete;
+
+  ScopedRefHolder& operator=(ScopedRefHolder&& other) noexcept {
+    ScopedRefHolder tmp(std::move(other));
+    swap(tmp);
+    return *this;
+  }
+
+  ~ScopedRefHolder();
+
+  void swap(ScopedRefHolder& other) noexcept {
+    std::swap(obj_, other.obj_);
+  }
+
+ private:
+  KRef obj_ = nullptr;
+};
+
+struct CycleDetectorRootset {
+  // Orders roots.
+  KStdVector<KRef> roots;
+  // Pins a state of each root.
+  KStdUnorderedMap<KRef, KStdVector<KRef>> rootToFields;
+  // Holding roots and their fields to avoid GC-ing them.
+  KStdVector<ScopedRefHolder> heldRefs;
+};
+
+class CycleDetector {
+ public:
+  static CycleDetector& instance() {
+    // Only store a single pointer in .bss
+    static CycleDetector* result = new CycleDetector();
+    return *result;
+  }
+
+  void insertCandidateIfNeeded(KRef object) {
+    if (canBeACandidate(object))
+      insertCandidate(object);
+  }
+
+  void removeCandidateIfNeeded(KRef object) {
+    if (canBeACandidate(object))
+      removeCandidate(object);
+  }
+
+  CycleDetectorRootset collectRootset();
+
+ private:
+  CycleDetector() = default;
+  ~CycleDetector() = default;
+  CycleDetector(const CycleDetector&) = delete;
+  CycleDetector(CycleDetector&&) = delete;
+  CycleDetector& operator=(const CycleDetector&) = delete;
+  CycleDetector& operator=(CycleDetector&&) = delete;
+
+  bool canBeACandidate(KRef object) {
+    return KonanNeedDebugInfo &&
+        Kotlin_memoryLeakCheckerEnabled() &&
+        (object->type_info()->flags_ & TF_LEAK_DETECTOR_CANDIDATE) != 0;
+  }
+
+  void insertCandidate(KRef candidate) {
+    LockGuard<SimpleMutex> guard(lock_);
+
+    auto it = candidateList_.insert(candidateList_.begin(), candidate);
+    candidateInList_.emplace(candidate, it);
+  }
+
+  void removeCandidate(KRef candidate) {
+    LockGuard<SimpleMutex> guard(lock_);
+
+    auto it = candidateInList_.find(candidate);
+    if (it == candidateInList_.end())
+      return;
+    candidateList_.erase(it->second);
+    candidateInList_.erase(it);
+  }
+
+  SimpleMutex lock_;
+  using CandidateList = KStdList<KRef>;
+  CandidateList candidateList_;
+  KStdUnorderedMap<KRef, CandidateList::iterator> candidateInList_;
+};
 
 // TODO: can we pass this variable as an explicit argument?
 THREAD_LOCAL_VARIABLE MemoryState* memoryState = nullptr;
@@ -961,23 +1054,8 @@ ALWAYS_INLINE void runDeallocationHooks(ContainerHeader* container) {
       cyclicRemoveAtomicRoot(obj);
     }
 #endif  // USE_CYCLIC_GC
+    CycleDetector::instance().removeCandidateIfNeeded(obj);
     if (obj->has_meta_object()) {
-      if (KonanNeedDebugInfo && (obj->type_info()->flags_ & TF_LEAK_DETECTOR_CANDIDATE) != 0 && Kotlin_memoryLeakCheckerEnabled()) {
-        LockGuard<SimpleMutex> leakCheckerGuard(g_leakCheckerGlobalLock);
-
-        // Remove the object from the double-linked list of potentially cyclic objects.
-        auto* previous = obj->meta_object()->LeakDetector.previous_;
-        auto* next = obj->meta_object()->LeakDetector.next_;
-        if (previous) {
-          previous->meta_object()->LeakDetector.next_ = next;
-        }
-        if (next) {
-          next->meta_object()->LeakDetector.previous_ = previous;
-        }
-        if (obj == g_leakCheckerGlobalList) {
-          g_leakCheckerGlobalList = next;
-        }
-      }
       ObjHeader::destroyMetaObject(&obj->typeInfoOrMeta_);
     }
     obj = reinterpret_cast<ObjHeader*>(reinterpret_cast<uintptr_t>(obj) + objectSize(obj));
@@ -2026,17 +2104,7 @@ OBJ_GETTER(allocInstance, const TypeInfo* type_info) {
 #endif  // USE_GC
   auto container = ObjectContainer(state, type_info);
   ObjHeader* obj = container.GetPlace();
-  if (KonanNeedDebugInfo && Kotlin_memoryLeakCheckerEnabled() && (type_info->flags_ & TF_LEAK_DETECTOR_CANDIDATE) != 0) {
-    LockGuard<SimpleMutex> leakCheckerGuard(g_leakCheckerGlobalLock);
-
-    // Add newly allocated object to the double-linked list of potentially cyclic objects.
-    KRef old = g_leakCheckerGlobalList;
-    g_leakCheckerGlobalList = obj;
-    obj->meta_object()->LeakDetector.next_ = old;
-    if (old != nullptr) {
-      old->meta_object()->LeakDetector.previous_ = obj;
-    }
-  }
+  CycleDetector::instance().insertCandidateIfNeeded(obj);
 #if USE_GC
   if (Strict) {
     rememberNewContainer(container.header());
@@ -2681,58 +2749,22 @@ void shareAny(ObjHeader* obj) {
   container->makeShared();
 }
 
-// TODO: Consider using ObjHolder.
-class ScopedRefHolder {
- public:
-  explicit ScopedRefHolder(KRef obj): obj_(obj) {
-    if (obj_) {
-      addHeapRef(obj_);
-    }
+ScopedRefHolder::ScopedRefHolder(KRef obj): obj_(obj) {
+  if (obj_) {
+    addHeapRef(obj_);
   }
+}
 
-  ScopedRefHolder(const ScopedRefHolder&) = delete;
-
-  ScopedRefHolder(ScopedRefHolder&& other) noexcept: obj_(other.obj_) {
-    other.obj_ = nullptr;
+ScopedRefHolder::~ScopedRefHolder() {
+  if (obj_) {
+    ReleaseHeapRef(obj_);
   }
+}
 
-  ScopedRefHolder& operator=(const ScopedRefHolder&) = delete;
-
-  ScopedRefHolder& operator=(ScopedRefHolder&& other) noexcept {
-    ScopedRefHolder tmp(std::move(other));
-    swap(tmp);
-    return *this;
-  }
-
-  ~ScopedRefHolder() {
-    if (obj_ != nullptr) {
-      ReleaseHeapRef(obj_);
-    }
-  }
-
-  void swap(ScopedRefHolder& other) noexcept {
-    std::swap(obj_, other.obj_);
-  }
-
- private:
-  KRef obj_ = nullptr;
-};
-
-struct CycleDetectorRootset {
-  // Orders roots.
-  KStdVector<KRef> roots;
-  // Pins a state of each root.
-  KStdUnorderedMap<KRef, KStdVector<KRef>> rootToFields;
-  // Holding roots and their fields to avoid GC-ing them.
-  KStdVector<ScopedRefHolder> heldRefs;
-};
-
-CycleDetectorRootset collectCycleDetectorRootset() {
+CycleDetectorRootset CycleDetector::collectRootset() {
   CycleDetectorRootset rootset;
-  LockGuard<SimpleMutex> leakCheckerGuard(g_leakCheckerGlobalLock);
-  for (auto* candidate = g_leakCheckerGlobalList;
-      candidate != nullptr;
-      candidate = candidate->meta_object()->LeakDetector.next_) {
+  LockGuard<SimpleMutex> guard(lock_);
+  for (auto* candidate: candidateList_) {
     rootset.roots.push_back(candidate);
     rootset.heldRefs.emplace_back(candidate);
     traverseReferredObjects(candidate, [&rootset, candidate](KRef field) {
@@ -2804,7 +2836,7 @@ OBJ_GETTER(createAndFillArray, const C& container) {
 }
 
 OBJ_GETTER0(detectCyclicReferences) {
-  auto rootset = collectCycleDetectorRootset();
+  auto rootset = CycleDetector::instance().collectRootset();
 
   KStdVector<KRef> cyclic;
 
@@ -2818,7 +2850,7 @@ OBJ_GETTER0(detectCyclicReferences) {
 }
 
 OBJ_GETTER(findCycle, KRef root) {
-  auto rootset = collectCycleDetectorRootset();
+  auto rootset = CycleDetector::instance().collectRootset();
 
   auto cycle = findCycleWithDFS(root, rootset);
   if (cycle.empty()) {

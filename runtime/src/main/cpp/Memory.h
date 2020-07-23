@@ -329,12 +329,6 @@ struct MetaObjHeader {
     // Strong reference to the counter object.
     ObjHeader* counter_;
   } WeakReference;
-  struct {
-    // Leak detector's previous list element.
-    ObjHeader* previous_;
-    // Leak detector's next list element.
-    ObjHeader* next_;
-  } LeakDetector;
 };
 
 // Header of every object.
