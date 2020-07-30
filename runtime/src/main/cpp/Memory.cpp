@@ -2404,14 +2404,14 @@ bool clearSubgraphReferences(ObjHeader* root, bool checked) {
   auto state = memoryState;
   auto* container = root->container();
 
-  // Free cyclic garbage to decrease number of analyzed objects.
-  checkIfForceCyclicGcNeeded(state);
-
   if (isShareable(container))
     // We assume, that frozen/shareable objects can be safely passed and not present
     // in the GC candidate list.
     // TODO: assert for that?
     return true;
+
+  // Free cyclic garbage to decrease number of analyzed objects.
+  checkIfForceCyclicGcNeeded(state);
 
   ContainerHeaderSet visited;
   if (!checked) {
